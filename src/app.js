@@ -14,13 +14,41 @@ const { notFound, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
 
+const clientUrl = process.env.CLIENT_URL;
+const allowedOrigins = clientUrl
+  ? clientUrl
+      .split(',')
+      .map((url) => url.trim().replace(/\/+$/, ''))
+      .filter(Boolean)
+  : [];
+
 app.use(helmet());
-app.use(cors({ origin: process.env.CLIENT_URL?.split(',') || true, credentials: true }));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow non-browser requests (Postman, curl, server-to-server)
+      if (!origin) return callback(null, true);
+      // Fallback if CLIENT_URL is not specified (e.g. dev)
+      if (!clientUrl) return callback(null, true);
+
+      const normalizedOrigin = origin.trim().replace(/\/+$/, '');
+      if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*')) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
+    credentials: true,
+  })
+);
 app.use(morgan('dev'));
 app.use(express.json());
 app.use(cookieParser());
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+// Root and Health routes
+app.get('/', (req, res) => res.json({ message: 'TWS Gift API is running' }));
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/categories', categoryRoutes);
