@@ -50,6 +50,115 @@ ${matched.length ? `Products matching the user's latest message:\n${matched.map(
 ${!matched.length && fallback.length ? `\nPopular products you may suggest:\n${fallback.map(productLine).join('\n')}` : ''}`;
 
 // POST /api/chat   body: { messages: [{ role: 'user'|'assistant', content: '...' }] }
+// ---------- Auto model selection ----------
+// Groq models aate-jaate rehte hain. Ye code khud Groq se available models ki list leta hai,
+// pasandida model chalata hai, aur agar koi model band ho jaye to agle model par chala jata hai.
+// .env / Render me GROQ_MODEL:
+//   (khali / "auto")  -> neeche ki MODEL_PREFERENCE list, phir baaki sab naye models (STABLE, recommended)
+//   "latest"          -> hamesha sabse naya available chat model pehle try karega
+//   "koi-model-naam"  -> wo model pehle try hoga, band ho gaya to auto fallback
+const MODEL_PREFERENCE = [
+  'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b',
+  'qwen/qwen3.6-27b',
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+];
+// Chat ke kaam ke nahi (speech, safety, embedding, etc.)
+const NOT_CHAT = /whisper|tts|playai|orpheus|guard|safeguard|embed|compound|transcribe|moderation/i;
+const MODEL_CACHE_MS = 6 * 60 * 60 * 1000; // list 6 ghante cache
+const BAD_MODEL_MS = 60 * 60 * 1000; // band model 1 ghante skip
+const MAX_TRIES = 4;
+
+let modelCache = { list: [], fetchedAt: 0, retryAt: 0 };
+const badModels = new Map(); // modelId -> kab tak skip karna hai
+let lastUsedModel = null;
+
+const refreshModels = async () => {
+  const now = Date.now();
+  if (modelCache.list.length && now - modelCache.fetchedAt < MODEL_CACHE_MS) return;
+  if (now < modelCache.retryAt) return;
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const j = await r.json();
+    const list = (j.data || [])
+      .filter((m) => m?.id && m.active !== false && !NOT_CHAT.test(m.id))
+      .sort((a, b) => (b.created || 0) - (a.created || 0)) // naye pehle
+      .map((m) => m.id);
+    if (list.length) modelCache = { list, fetchedAt: now, retryAt: 0 };
+  } catch (err) {
+    console.error('Groq models list error:', err.message);
+    modelCache.retryAt = now + 60 * 1000; // 1 minute baad dobara try
+  }
+};
+
+const buildCandidates = async () => {
+  await refreshModels();
+  const now = Date.now();
+  const available = modelCache.list; // khali ho sakti hai agar list API fail hui
+  const usable = (id) => !(badModels.get(id) > now) && (!available.length || available.includes(id));
+  const ordered = [];
+  const push = (id) => {
+    if (id && !ordered.includes(id) && usable(id)) ordered.push(id);
+  };
+
+  const pref = (process.env.GROQ_MODEL || '').trim();
+  if (pref.toLowerCase() === 'latest') {
+    available.forEach(push);
+    MODEL_PREFERENCE.forEach(push);
+  } else {
+    if (pref && pref.toLowerCase() !== 'auto') push(pref);
+    MODEL_PREFERENCE.forEach(push);
+    available.forEach(push); // preference list ke sab model band ho gaye to naye models
+  }
+  if (!ordered.length) ordered.push(MODEL_PREFERENCE[0]); // list API aur sab fail: aakhri koshish
+  return ordered.slice(0, MAX_TRIES);
+};
+
+// Model band / hata diya gaya hai?
+const isModelGone = (status, body) =>
+  status === 404 ||
+  (status === 400 && /decommission|deprecat|not found|does not exist|model_not_found|no longer|not supported/i.test(body));
+
+const cleanReply = (text) =>
+  (text || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '') // kuch models soch (think) bhi bhejte hain
+    .trim();
+
+const callGroq = async (model, systemPrompt, messages) => {
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'system', content: systemPrompt }, ...messages],
+        temperature: 0.5,
+        // reasoning models me thinking tokens bhi isi limit me ginte hain, isliye limit badi hai
+        max_tokens: 1000,
+        ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
+      }),
+    });
+    const text = await response.text();
+    if (!response.ok) return { ok: false, status: response.status, body: text };
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      /* ignore */
+    }
+    return { ok: true, status: 200, reply: cleanReply(data.choices?.[0]?.message?.content) };
+  } catch (err) {
+    return { ok: false, status: 0, body: err.message };
+  }
+};
+
 const chat = async (req, res) => {
   const raw = Array.isArray(req.body?.messages) ? req.body.messages : [];
   const messages = raw
@@ -70,28 +179,38 @@ const chat = async (req, res) => {
     ? []
     : await productModel.find({ isActive: true, isBestSeller: true }).limit(5).populate('category', 'name');
 
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
-      messages: [{ role: 'system', content: buildSystemPrompt(matched, fallback) }, ...messages],
-      temperature: 0.5,
-      max_tokens: 400,
-    }),
-  });
+  const systemPrompt = buildSystemPrompt(matched, fallback);
+  const candidates = await buildCandidates();
 
-  if (!response.ok) {
-    console.error('Chat provider error:', response.status, await response.text());
-    return res.status(502).json({ message: 'Chatbot abhi available nahi hai, thodi der baad try karo' });
+  let reply = '';
+  for (const model of candidates) {
+    const out = await callGroq(model, systemPrompt, messages);
+
+    if (out.ok && out.reply) {
+      reply = out.reply;
+      if (lastUsedModel !== model) {
+        console.log('Chat model in use:', model);
+        lastUsedModel = model;
+      }
+      break;
+    }
+    if (out.ok) {
+      console.error('Chat model gave empty reply:', model);
+      continue; // khali jawab: agla model
+    }
+
+    console.error('Chat provider error:', model, out.status, String(out.body).slice(0, 300));
+    if (out.status === 401 || out.status === 403) break; // key galat, models badalne se fayda nahi
+    if (isModelGone(out.status, String(out.body))) {
+      badModels.set(model, Date.now() + BAD_MODEL_MS);
+      modelCache.fetchedAt = 0; // list dobara fetch ho
+    }
+    // 429 / 5xx / model gone: agla model try hoga
   }
 
-  const data = await response.json();
-  const reply = data.choices?.[0]?.message?.content?.trim();
-  if (!reply) return res.status(502).json({ message: 'Chatbot se jawab nahi mila' });
+  if (!reply) {
+    return res.status(502).json({ message: 'Chatbot abhi available nahi hai, thodi der baad try karo' });
+  }
 
   res.json({
     reply,

@@ -14,31 +14,34 @@ const { notFound, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
 
+// Render/Vercel jaise proxy ke peeche real user ki IP (rate limit ke liye) sahi milne ke liye
+app.set('trust proxy', 1);
+
 const clientUrl = process.env.CLIENT_URL;
 const allowedOrigins = clientUrl
-  ? clientUrl
-      .split(',')
-      .map((url) => url.trim().replace(/\/+$/, ''))
-      .filter(Boolean)
-  : [];
+    ? clientUrl
+        .split(',')
+        .map((url) => url.trim().replace(/\/+$/, ''))
+        .filter(Boolean)
+    : [];
 
 app.use(helmet());
 app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow non-browser requests (Postman, curl, server-to-server)
-      if (!origin) return callback(null, true);
-      // Fallback if CLIENT_URL is not specified (e.g. dev)
-      if (!clientUrl) return callback(null, true);
+    cors({
+        origin: (origin, callback) => {
+            // Allow non-browser requests (Postman, curl, server-to-server)
+            if (!origin) return callback(null, true);
+            // Fallback if CLIENT_URL is not specified (e.g. dev)
+            if (!clientUrl) return callback(null, true);
 
-      const normalizedOrigin = origin.trim().replace(/\/+$/, '');
-      if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*')) {
-        return callback(null, true);
-      }
-      return callback(null, false);
-    },
-    credentials: true,
-  })
+            const normalizedOrigin = origin.trim().replace(/\/+$/, '');
+            if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*')) {
+                return callback(null, true);
+            }
+            return callback(null, false);
+        },
+        credentials: true,
+    })
 );
 app.use(morgan('dev'));
 app.use(express.json());
