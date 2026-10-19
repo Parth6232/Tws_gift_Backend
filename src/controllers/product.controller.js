@@ -35,6 +35,54 @@ const pick = (body = {}) => {
   return data;
 };
 
+// ---------- SEARCH ----------
+// Pehle MongoDB $text use hota tha: wo sirf POORE shabd pakadta hai ("pol" ya "calender" par kuch nahi milta).
+// Ab har shabd ka partial match hota hai (title, tags, description, category naam me), aur
+// agar kuch na mile to thoda "close match" try hota hai (typo ke liye: "calender" -> "calend...").
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const getSearchTokens = (search, relaxed = false) => {
+  let tokens = String(search)
+    .toLowerCase()
+    .slice(0, 80)
+    .split(/\s+/)
+    .map((t) => t.replace(/[^\p{L}\p{N}-]/gu, '')) // &, quotes, etc. hata do
+    .filter(Boolean);
+  if (tokens.length > 1) tokens = tokens.filter((t) => t.length > 1); // akela "t" ya "&" noise hai
+  tokens = tokens.slice(0, 6);
+  if (relaxed) tokens = tokens.map((t) => (t.length >= 5 ? t.slice(0, t.length - 2) : t));
+  return tokens;
+};
+
+// Match shabd ke SHURU se hota hai ("men" ab "Women" ko match nahi karega, "pol" -> "Polo" karega).
+// "tshirt" bhi "T-Shirts" ko match kare: har akshar ke beech optional '-' ya space.
+const tokenRegex = (token) =>
+  new RegExp(
+    '(^|[^a-zA-Z0-9])' +
+    token
+      .split('')
+      .map((ch) => escapeRegex(ch))
+      .join('[-\\s]?'),
+    'i'
+  );
+
+const buildSearchClauses = async (search, relaxed) => {
+  const tokens = getSearchTokens(search, relaxed);
+  if (!tokens.length) return [];
+  const categories = await categoryModel.find().select('name');
+  const clauseFor = (token) => {
+    const rx = tokenRegex(token);
+    const catIds = categories.filter((c) => rx.test(c.name)).map((c) => c._id);
+    return {
+      $or: [{ title: rx }, { tags: rx }, { description: rx }, ...(catIds.length ? [{ category: { $in: catIds } }] : [])],
+    };
+  };
+  const perToken = tokens.map(clauseFor);
+  if (tokens.length < 2) return perToken;
+  // "back pack" -> "backpack": poori query ko bina space ke ek shabd maan ke bhi try karo
+  return [{ $or: [{ $and: perToken }, clauseFor(tokens.join(''))] }];
+};
+
 // PUBLIC: GET /api/products?category=mug&search=pen&minPrice=0&maxPrice=999&bestSeller=true&premium=true&page=1&limit=12&sort=-createdAt
 const listProducts = async (req, res) => {
   const { category, search, minPrice, maxPrice, bestSeller, premium, newArrival, page = 1, limit = 12, sort = '-createdAt' } = req.query;
@@ -44,7 +92,6 @@ const listProducts = async (req, res) => {
     const cat = await categoryModel.findOne({ slug: category });
     filter.category = cat ? cat._id : null;
   }
-  if (search) filter.$text = { $search: search };
   if (minPrice || maxPrice) {
     filter.price = {};
     if (minPrice) filter.price.$gte = Number(minPrice);
@@ -54,15 +101,39 @@ const listProducts = async (req, res) => {
   if (premium === 'true') filter.isPremium = true;
   if (newArrival === 'true') filter.isNewArrival = true;
 
-  const p = Math.max(Number(page), 1);
-  const l = Math.min(Math.max(Number(limit), 1), 60);
+  const p = Math.max(Number(page) || 1, 1);
+  const l = Math.min(Math.max(Number(limit) || 12, 1), 60);
 
-  const [items, total] = await Promise.all([
-    productModel.find(filter).populate('category', 'name slug').sort(sort).skip((p - 1) * l).limit(l),
-    productModel.countDocuments(filter),
-  ]);
-  res.json({ items, total, page: p, pages: Math.ceil(total / l) });
+  const run = (extraClauses) => {
+    const f = extraClauses.length ? { ...filter, $and: extraClauses } : filter;
+    return Promise.all([
+      productModel.find(f).populate('category', 'name slug').sort(sort).skip((p - 1) * l).limit(l),
+      productModel.countDocuments(f),
+    ]);
+  };
+
+  let relaxed = false;
+  let items;
+  let total;
+  if (search && String(search).trim()) {
+    [items, total] = await run(await buildSearchClauses(search, false));
+    if (total === 0) {
+      // koi exact match nahi: close match (typo) try karo
+      const clauses = await buildSearchClauses(search, true);
+      const [rItems, rTotal] = await run(clauses);
+      if (rTotal > 0) {
+        items = rItems;
+        total = rTotal;
+        relaxed = true;
+      }
+    }
+  } else {
+    [items, total] = await run([]);
+  }
+
+  res.json({ items, total, page: p, pages: Math.ceil(total / l), relaxed });
 };
+
 
 // PUBLIC
 const getProductBySlug = async (req, res) => {
