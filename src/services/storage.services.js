@@ -6,13 +6,23 @@ const ImageKitClient = new ImageKit({
   privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
 });
 
+// ImageKit folder me space/special character allowed nahi hai (400 error aata hai).
+// Isliye har folder path ko safe bana dete hain: '/TWS Gift/products' -> '/TWS-Gift/products'
+const cleanFolder = (folder) =>
+  '/' +
+  String(folder || '')
+    .split('/')
+    .map((part) => part.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, ''))
+    .filter(Boolean)
+    .join('/');
+
 const cleanName = (name) => String(name || 'image').replace(/[^a-zA-Z0-9._-]/g, '_');
 
 // input 2 tarah ka ho sakta hai:
 //  1) string  -> disk par image ka path (seedImages.js isi tarah use karta hai)
 //  2) object  -> multer memoryStorage ki file ({ buffer, originalname, mimetype }) (admin panel se upload)
 // folder = ImageKit ka folder, jaise '/dearkeeps/products/some-slug'
-async function uploadfile(input, folder = '/TWS Gift/products') {
+async function uploadfile(input, folder = '/tws-gift/products') {
   let file;
   let fileName;
 
@@ -33,7 +43,7 @@ async function uploadfile(input, folder = '/TWS Gift/products') {
   const result = await ImageKitClient.files.upload({
     file,
     fileName,
-    folder,
+    folder: cleanFolder(folder),
     useUniqueFileName: true,
   });
   return { url: result.url, publicId: result.fileId };
